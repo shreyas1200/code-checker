@@ -47,9 +47,97 @@ export default async function handler(req, res) {
     });
   }
 
+  // ─── REDEEMED CODES TRACKING ───
+  // We use Shopify metafields on the shop to track in-store redemptions
+  // since we can't modify usage_count directly via API.
+  // Alternative: we delete the discount code and track it separately.
+
+  async function getRedeemedCodes() {
+    try {
+      const r = await shopifyFetch('/metafields.json?namespace=coupon_verify&key=redeemed_codes');
+      if (!r.ok) return [];
+      const data = await r.json();
+      if (data.metafields && data.metafields.length > 0) {
+        return JSON.parse(data.metafields[0].value);
+      }
+      return [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  async function addRedeemedCode(code, metafieldId) {
+    const redeemed = await getRedeemedCodes();
+    const entry = {
+      code: code,
+      redeemedAt: new Date().toISOString(),
+      method: 'in-store'
+    };
+    redeemed.push(entry);
+
+    if (metafieldId) {
+      // Update existing metafield
+      await shopifyFetch(`/metafields/${metafieldId}.json`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          metafield: {
+            id: metafieldId,
+            value: JSON.stringify(redeemed)
+          }
+        })
+      });
+    } else {
+      // Create new metafield
+      await shopifyFetch('/metafields.json', {
+        method: 'POST',
+        body: JSON.stringify({
+          metafield: {
+            namespace: 'coupon_verify',
+            key: 'redeemed_codes',
+            value: JSON.stringify(redeemed),
+            type: 'json'
+          }
+        })
+      });
+    }
+
+    return entry;
+  }
+
+  async function isCodeRedeemed(code) {
+    const redeemed = await getRedeemedCodes();
+    return redeemed.find(r => r.code.toUpperCase() === code.toUpperCase());
+  }
+
+  async function getMetafieldId() {
+    try {
+      const r = await shopifyFetch('/metafields.json?namespace=coupon_verify&key=redeemed_codes');
+      if (!r.ok) return null;
+      const data = await r.json();
+      if (data.metafields && data.metafields.length > 0) {
+        return data.metafields[0].id;
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   try {
 
+    // ─── VERIFY ───
     if (action === 'verify') {
+
+      // First check if already redeemed in-store
+      const redeemed = await isCodeRedeemed(cleanCode);
+      if (redeemed) {
+        return res.status(200).json({
+          status: 'used',
+          usedDate: formatDate(redeemed.redeemedAt),
+          method: 'Redeemed in-store'
+        });
+      }
+
       const lookup = await shopifyFetch(
         `/discount_codes/lookup.json?code=${encodeURIComponent(cleanCode)}`
       );
@@ -66,14 +154,17 @@ export default async function handler(req, res) {
       }
       const { price_rule } = await prRes.json();
 
+      // Check if used online (usage_count from Shopify)
       const limit = price_rule.usage_limit || Infinity;
       if (discount_code.usage_count >= limit) {
         return res.status(200).json({
           status: 'used',
-          usedDate: formatDate(discount_code.updated_at)
+          usedDate: formatDate(discount_code.updated_at),
+          method: 'Used online'
         });
       }
 
+      // Check expiry
       if (price_rule.ends_at && new Date(price_rule.ends_at) < new Date()) {
         return res.status(200).json({
           status: 'expired',
@@ -81,6 +172,7 @@ export default async function handler(req, res) {
         });
       }
 
+      // Check not yet active
       if (price_rule.starts_at && new Date(price_rule.starts_at) > new Date()) {
         return res.status(200).json({
           status: 'invalid',
@@ -88,6 +180,7 @@ export default async function handler(req, res) {
         });
       }
 
+      // Valid!
       let discount = '';
       const val = Math.abs(parseFloat(price_rule.value));
       if (price_rule.value_type === 'percentage') {
@@ -106,7 +199,16 @@ export default async function handler(req, res) {
       });
     }
 
+    // ─── REDEEM ───
     if (action === 'redeem') {
+
+      // Check if already redeemed
+      const alreadyRedeemed = await isCodeRedeemed(cleanCode);
+      if (alreadyRedeemed) {
+        return res.status(200).json({ success: false, error: 'Already redeemed in-store' });
+      }
+
+      // Verify code exists in Shopify
       const lookup = await shopifyFetch(
         `/discount_codes/lookup.json?code=${encodeURIComponent(cleanCode)}`
       );
@@ -115,38 +217,35 @@ export default async function handler(req, res) {
       }
       const { discount_code } = await lookup.json();
 
+      // Check if used online
       if (discount_code.usage_count > 0) {
-        return res.status(200).json({ success: false, error: 'Already redeemed' });
+        return res.status(200).json({ success: false, error: 'Already used online' });
       }
 
-      const prRes = await shopifyFetch(
-        `/price_rules/${discount_code.price_rule_id}.json`
-      );
-      const { price_rule } = await prRes.json();
-
-      const now = new Date().toISOString();
-      const updateRes = await shopifyFetch(
-        `/price_rules/${discount_code.price_rule_id}.json`,
-        {
-          method: 'PUT',
-          body: JSON.stringify({
-            price_rule: {
-              id: discount_code.price_rule_id,
-              ends_at: now,
-              title: price_rule.title + ' [REDEEMED-INSTORE]'
-            }
-          })
-        }
+      // Delete the discount code from Shopify so it can't be used online anymore
+      const deleteRes = await shopifyFetch(
+        `/price_rules/${discount_code.price_rule_id}/discount_codes/${discount_code.id}.json`,
+        { method: 'DELETE' }
       );
 
-      if (!updateRes.ok) {
-        return res.status(200).json({ success: false, error: 'Failed to update in Shopify' });
-      }
+      // Track the redemption in metafields
+      const metafieldId = await getMetafieldId();
+      const entry = await addRedeemedCode(cleanCode, metafieldId);
 
-      return res.status(200).json({ success: true, redeemedAt: now });
+      return res.status(200).json({
+        success: true,
+        redeemedAt: entry.redeemedAt,
+        message: 'Code deleted from Shopify and marked as redeemed in-store'
+      });
     }
 
-    return res.status(200).json({ error: 'action must be verify or redeem' });
+    // ─── LIST REDEEMED ───
+    if (action === 'list-redeemed') {
+      const redeemed = await getRedeemedCodes();
+      return res.status(200).json({ redeemed });
+    }
+
+    return res.status(200).json({ error: 'action must be verify, redeem, or list-redeemed' });
 
   } catch (err) {
     console.error('API Error:', err);
